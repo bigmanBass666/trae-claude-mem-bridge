@@ -26,6 +26,8 @@ import subprocess
 import urllib.request
 import urllib.error
 import urllib.parse
+import logging
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 WORKER_HOST = "127.0.0.1"
@@ -35,6 +37,34 @@ WORKER_URL = f"http://{WORKER_HOST}:{WORKER_PORT}"
 PLUGIN_ROOT = r"C:\Users\86150\.claude\plugins\cache\thedotmack\claude-mem\12.1.0"
 BUN_RUNNER = os.path.join(PLUGIN_ROOT, "scripts", "bun-runner.js")
 WORKER_SERVICE = os.path.join(PLUGIN_ROOT, "scripts", "worker-service.cjs")
+
+LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
+LOG_FILE = os.path.join(LOG_DIR, "trae_bridge.log")
+
+
+def setup_logger(name: str = "trae-bridge", level: int = logging.INFO) -> logging.Logger:
+    logger = logging.getLogger(name)
+    if logger.handlers:
+        return logger
+    logger.setLevel(level)
+    Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
+    file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    file_handler.setFormatter(file_formatter)
+    console_handler = logging.StreamHandler(sys.stderr)
+    console_handler.setLevel(logging.INFO)
+    console_formatter = logging.Formatter("[%(levelname)s] %(message)s")
+    console_handler.setFormatter(console_formatter)
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    return logger
+
+
+logger = setup_logger("trae-bridge", logging.INFO)
 
 SKIP_TOOLS = frozenset([
     "ListMcpResourcesTool",
@@ -131,7 +161,7 @@ def _start_worker() -> bool:
     global _worker_process
     bun_exe = _find_bun_executable()
     if not bun_exe:
-        print("[trae-mem-bridge v6] ERROR: Bun executable not found, cannot auto-start worker", file=sys.stderr)
+        logger.error("Bun executable not found, cannot auto-start worker")
         return False
     try:
         import base64
@@ -143,25 +173,25 @@ def _start_worker() -> bool:
             stderr=subprocess.DEVNULL,
             creationflags=0x08000000,
         )
-        print(f"[trae-mem-bridge v6] Auto-started worker via PowerShell (bun={bun_exe})", file=sys.stderr)
+        logger.info(f"Auto-started worker via PowerShell (bun={bun_exe})")
         return True
     except Exception as e:
-        print(f"[trae-mem-bridge v6] Failed to start worker: {e}", file=sys.stderr)
+        logger.error(f"Failed to start worker: {e}")
         return False
 
 
 def _ensure_worker_running(max_retries: int = 3, retry_interval: float = 2.0) -> bool:
     if _is_worker_running():
         return True
-    print("[trae-mem-bridge v6] Worker not running, attempting auto-start...", file=sys.stderr)
+    logger.info("Worker not running, attempting auto-start...")
     if not _start_worker():
         return False
     for attempt in range(max_retries):
         time.sleep(retry_interval)
         if _is_worker_running():
-            print(f"[trae-mem-bridge v6] Worker ready after {retry_interval * (attempt + 1):.1f}s", file=sys.stderr)
+            logger.info(f"Worker ready after {retry_interval * (attempt + 1):.1f}s")
             return True
-    print(f"[trae-mem-bridge v6] WARNING: Worker did not start within {max_retries * retry_interval:.0f}s", file=sys.stderr)
+    logger.warning(f"Worker did not start within {max_retries * retry_interval:.0f}s")
     return False
 
 
@@ -201,6 +231,7 @@ def _tool_result(text: str, is_error: bool = False) -> Dict:
 
 def handle_hook_event(args: Dict) -> Dict:
     if not _ensure_worker_running():
+        logger.error("Worker not available (auto-start failed)")
         return {"type": "text", "text": "ERROR: Worker not available (auto-start failed)"}
     event = args.get("event", "")
     payload = args.get("payload", {})
@@ -208,9 +239,11 @@ def handle_hook_event(args: Dict) -> Dict:
     cwd = payload.get("cwd", "") or os.getcwd()
 
     if not session_id:
+        logger.error("Missing session_id in payload")
         return _tool_result("Error: missing session_id", is_error=True)
 
     project = cwd.replace("\\", "/").rstrip("/").split("/")[-1] if cwd else "unknown"
+    logger.debug(f"Handling event: {event} | session: {session_id} | project: {project}")
 
     hook_mapping = {
         "SessionStart": "context",
@@ -226,20 +259,24 @@ def handle_hook_event(args: Dict) -> Dict:
 
     hook_type = hook_mapping.get(event)
     if not hook_type:
+        logger.warning(f"Unknown event type: {event}")
         return _tool_result(f"Unknown event type: {event}", is_error=True)
 
     # --- 内部消息过滤 ---
     if event == "UserPromptSubmit":
         prompt_text = payload.get("prompt", "")
         if _is_internal_message(prompt_text):
+            logger.debug(f"Skipped internal message: {prompt_text[:50]}...")
             return _tool_result(f"[{event}] Skipped internal message", is_error=False)
         if not prompt_text or not prompt_text.strip():
+            logger.debug("Skipped empty prompt")
             return _tool_result(f"[{event}] Skipped empty prompt", is_error=False)
 
     # --- SKIP_TOOLS 客户端过滤 ---
     if event in ("PostToolUse", "afterMCPExecution", "afterShellExecution", "afterFileEdit"):
         tool_name = payload.get("tool_name", "")
         if tool_name in SKIP_TOOLS:
+            logger.debug(f"Skipped tool (SKIP_TOOLS): {tool_name}")
             return _tool_result(f"[{event}] Skipped tool: {tool_name}", is_error=False)
 
     # --- 构造 worker payload (raw normalizer兼容格式) ---
@@ -289,6 +326,7 @@ def handle_hook_event(args: Dict) -> Dict:
     result = _call_worker_hook(hook_type, worker_payload)
 
     if "error" in result:
+        logger.error(f"Hook error ({event}/{hook_type}): {result['error']}")
         return _tool_result(f"Hook error ({event}/{hook_type}): {result['error']}", is_error=True)
 
     # --- 格式化响应 ---
@@ -651,8 +689,8 @@ def serve_stdio():
 
 
 if __name__ == "__main__":
-    print("[trae-mem-bridge v6] Starting MCP server...", file=sys.stderr)
-    print(f"[trae-mem-bridge v6] Plugin root: {PLUGIN_ROOT}", file=sys.stderr)
-    print(f"[trae-mem-bridge v6] Bun runner: {BUN_RUNNER}", file=sys.stderr)
-    print(f"[trae-mem-bridge v6] Auto-start enabled | platform=trae | SKIP_TOOLS={len(SKIP_TOOLS)} tools | HTTP API for summarize/complete", file=sys.stderr)
+    logger.info("Starting MCP server...")
+    logger.info(f"Plugin root: {PLUGIN_ROOT}")
+    logger.info(f"Bun runner: {BUN_RUNNER}")
+    logger.info(f"Auto-start enabled | platform=trae | SKIP_TOOLS={len(SKIP_TOOLS)} tools | HTTP API for summarize/complete")
     serve_stdio()
