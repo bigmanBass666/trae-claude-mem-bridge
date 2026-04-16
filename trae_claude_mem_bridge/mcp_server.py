@@ -134,16 +134,16 @@ def _start_worker() -> bool:
         print("[trae-mem-bridge v6] ERROR: Bun executable not found, cannot auto-start worker", file=sys.stderr)
         return False
     try:
-        CREATE_NO_WINDOW = 0x08000000
-        DETACHED_PROCESS = 0x00000008
-        _worker_process = subprocess.Popen(
-            [bun_exe, WORKER_SERVICE],
-            cwd=PLUGIN_ROOT,
+        import base64
+        ps_command = f"Start-Process -FilePath '{bun_exe}' -ArgumentList @('{WORKER_SERVICE}','--daemon') -WindowStyle Hidden"
+        ps_encoded = base64.b64encode(ps_command.encode('utf-16le')).decode('ascii')
+        subprocess.Popen(
+            ["powershell", "-NoProfile", "-EncodedCommand", ps_encoded],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            creationflags=CREATE_NO_WINDOW | DETACHED_PROCESS,
+            creationflags=0x08000000,
         )
-        print(f"[trae-mem-bridge v6] Auto-started worker (PID={_worker_process.pid}, bun={bun_exe})", file=sys.stderr)
+        print(f"[trae-mem-bridge v6] Auto-started worker via PowerShell (bun={bun_exe})", file=sys.stderr)
         return True
     except Exception as e:
         print(f"[trae-mem-bridge v6] Failed to start worker: {e}", file=sys.stderr)
