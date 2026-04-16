@@ -88,7 +88,7 @@ def _make_request(
     timeout: int = 10
 ) -> Dict[str, Any]:
     url = f"{WORKER_URL}{endpoint}"
-    headers = {"Content-Type": "application/json"}
+    headers = {"Content-Type": "application/json", "Connection": "close"}
     data = None
     if body:
         data = json.dumps(body).encode("utf-8")
@@ -128,6 +128,8 @@ def _is_internal_message(text: str) -> bool:
 
 
 _worker_process = None
+_worker_last_health_check = 0
+_WORKER_HEALTH_CHECK_INTERVAL = 30
 
 
 def _find_bun_executable() -> Optional[str]:
@@ -144,6 +146,41 @@ def _find_bun_executable() -> Optional[str]:
         if os.path.isfile(p):
             return p
     return None
+
+
+def _is_worker_responsive() -> bool:
+    import socket
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(2)
+            result = s.connect_ex((WORKER_HOST, WORKER_PORT))
+            if result != 0:
+                return False
+        import urllib.request
+        req = urllib.request.Request(f"http://{WORKER_HOST}:{WORKER_PORT}/health")
+        req.add_header("Connection", "close")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def _kill_stale_worker() -> bool:
+    import subprocess
+    import signal
+    try:
+        result = subprocess.run(
+            ["powershell", "-Command",
+             f"(Get-NetTCPConnection -LocalPort {WORKER_PORT} -ErrorAction SilentlyContinue).OwningProcess | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"],
+            capture_output=True,
+            timeout=10
+        )
+        import time
+        time.sleep(1)
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to kill stale worker: {e}")
+        return False
 
 
 def _is_worker_running() -> bool:
@@ -181,15 +218,32 @@ def _start_worker() -> bool:
 
 
 def _ensure_worker_running(max_retries: int = 3, retry_interval: float = 2.0) -> bool:
+    global _worker_last_health_check
+    import time
     if _is_worker_running():
+        if time.time() - _worker_last_health_check > _WORKER_HEALTH_CHECK_INTERVAL:
+            _worker_last_health_check = time.time()
+            if not _is_worker_responsive():
+                logger.warning("Worker not responsive, killing stale process...")
+                _kill_stale_worker()
+                if not _start_worker():
+                    return False
+                for attempt in range(max_retries):
+                    time.sleep(retry_interval)
+                    if _is_worker_responsive():
+                        logger.info(f"Worker reconnected after {retry_interval * (attempt + 1):.1f}s")
+                        return True
+                logger.warning("Worker failed to become responsive")
+                return False
         return True
     logger.info("Worker not running, attempting auto-start...")
     if not _start_worker():
         return False
     for attempt in range(max_retries):
         time.sleep(retry_interval)
-        if _is_worker_running():
+        if _is_worker_responsive():
             logger.info(f"Worker ready after {retry_interval * (attempt + 1):.1f}s")
+            _worker_last_health_check = time.time()
             return True
     logger.warning(f"Worker did not start within {max_retries * retry_interval:.0f}s")
     return False
@@ -638,6 +692,8 @@ def _write(obj: Any):
 def _read() -> Optional[Dict]:
     try:
         line = input()
+        if line.startswith('\ufeff'):
+            line = line.lstrip('\ufeff')
         return json.loads(line)
     except EOFError:
         return None

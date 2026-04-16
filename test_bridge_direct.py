@@ -1,7 +1,7 @@
 import subprocess, json
 
 proc = subprocess.Popen(
-    ["python", "-u", r"D:\Test\trae_message_extraction\trae_mem_bridge\mcp_server.py"],
+    ["python", "-u", r"D:\Test\trae_message_extraction\trae_claude_mem_bridge\mcp_server.py"],
     stdin=subprocess.PIPE,
     stdout=subprocess.PIPE,
     stderr=subprocess.PIPE,
