@@ -1,5 +1,5 @@
 """
-Trae-Claude-Mem Bridge MCP Server v5
+Trae-Claude-Mem Bridge MCP Server v6
 将 Trae IDE 的会话事件桥接到 Claude-Mem Worker
 
 基于 worker-service.cjs 源码深度审查后的全面改进:
@@ -13,11 +13,15 @@ E. raw normalizer的field mapping → 确保驼峰+下划线双兼容
 F. platform=trae让Rt()返回原值 → Web UI显示TRAE标签
 G. 内部系统消息过滤 → <task-notification>等XML不当用户prompt
 H. session-complete通过HTTP API调用(更可靠)
+
+v6 新增:
+I. Worker 自动检测与启动 → 用户无需手动启动Worker, 打开Trae即用 (对标Claude CLI体验)
 """
 
 import json
 import sys
 import os
+import time
 import subprocess
 import urllib.request
 import urllib.error
@@ -93,6 +97,74 @@ def _is_internal_message(text: str) -> bool:
     return False
 
 
+_worker_process = None
+
+
+def _find_bun_executable() -> Optional[str]:
+    import shutil
+    bun_path = shutil.which("bun")
+    if bun_path:
+        return bun_path
+    common_paths = [
+        os.path.expanduser(r"~\.bun\bin\bun.exe"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Bun", "bun.exe"),
+        r"C:\Users\86150\.bun\bin\bun.exe",
+    ]
+    for p in common_paths:
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def _is_worker_running() -> bool:
+    import socket
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(2)
+            result = s.connect_ex((WORKER_HOST, WORKER_PORT))
+            return result == 0
+    except Exception:
+        return False
+
+
+def _start_worker() -> bool:
+    global _worker_process
+    bun_exe = _find_bun_executable()
+    if not bun_exe:
+        print("[trae-mem-bridge v6] ERROR: Bun executable not found, cannot auto-start worker", file=sys.stderr)
+        return False
+    try:
+        CREATE_NO_WINDOW = 0x08000000
+        DETACHED_PROCESS = 0x00000008
+        _worker_process = subprocess.Popen(
+            [bun_exe, WORKER_SERVICE],
+            cwd=PLUGIN_ROOT,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=CREATE_NO_WINDOW | DETACHED_PROCESS,
+        )
+        print(f"[trae-mem-bridge v6] Auto-started worker (PID={_worker_process.pid}, bun={bun_exe})", file=sys.stderr)
+        return True
+    except Exception as e:
+        print(f"[trae-mem-bridge v6] Failed to start worker: {e}", file=sys.stderr)
+        return False
+
+
+def _ensure_worker_running(max_retries: int = 3, retry_interval: float = 2.0) -> bool:
+    if _is_worker_running():
+        return True
+    print("[trae-mem-bridge v6] Worker not running, attempting auto-start...", file=sys.stderr)
+    if not _start_worker():
+        return False
+    for attempt in range(max_retries):
+        time.sleep(retry_interval)
+        if _is_worker_running():
+            print(f"[trae-mem-bridge v6] Worker ready after {retry_interval * (attempt + 1):.1f}s", file=sys.stderr)
+            return True
+    print(f"[trae-mem-bridge v6] WARNING: Worker did not start within {max_retries * retry_interval:.0f}s", file=sys.stderr)
+    return False
+
+
 def _call_worker_hook(hook_type: str, payload: Dict) -> Dict:
     cmd = ["node", BUN_RUNNER, WORKER_SERVICE, "hook", "trae", hook_type]
     stdin_input = json.dumps(payload or {}, ensure_ascii=False)
@@ -128,6 +200,8 @@ def _tool_result(text: str, is_error: bool = False) -> Dict:
 
 
 def handle_hook_event(args: Dict) -> Dict:
+    if not _ensure_worker_running():
+        return {"type": "text", "text": "ERROR: Worker not available (auto-start failed)"}
     event = args.get("event", "")
     payload = args.get("payload", {})
     session_id = payload.get("session_id", "")
@@ -300,6 +374,8 @@ def _handle_session_complete(session_id: str, project: str, cwd: str) -> Dict:
 
 
 def handle_search(args: Dict) -> Dict:
+    if not _ensure_worker_running():
+        return {"type": "text", "text": "ERROR: Worker not available (auto-start failed)"}
     query = args.get("query", "")
     limit = args.get("limit", 20)
     project = args.get("project", "")
@@ -322,82 +398,102 @@ def handle_search(args: Dict) -> Dict:
 
 
 def handle_timeline(args: Dict) -> Dict:
-    observation_id = args.get("observation_id")
-    query = args.get("query", "")
-    if observation_id:
-        result = _make_request(f"/api/timeline/{observation_id}")
-    elif query:
-        result = _make_request(f"/api/timeline?q={urllib.parse.quote(query)}")
-    else:
-        return _tool_result("Error: need observation_id or query", is_error=True)
-    if "error" in result:
-        return _tool_result(f"Timeline error: {result['error']}", is_error=True)
-    items = result.get("items", []) if isinstance(result, dict) else []
-    output = f"Timeline ({len(items)} items):\n\n"
-    for item in items[:10]:
-        output += f"- [{item.get('id', '?')}] {item.get('title', '')}\n"
-        output += f"  {item.get('created_at', '')} | {item.get('type', '')}\n\n"
-    return _tool_result(output)
+    if not _ensure_worker_running():
+        return {"type": "text", "text": "ERROR: Worker not available (auto-start failed)"}
+    try:
+        observation_id = args.get("observation_id")
+        query = args.get("query", "")
+        if observation_id:
+            result = _make_request(f"/api/timeline/{observation_id}")
+        elif query:
+            result = _make_request(f"/api/timeline?q={urllib.parse.quote(query)}")
+        else:
+            return _tool_result("Error: need observation_id or query", is_error=True)
+        if "error" in result:
+            return _tool_result(f"Timeline error: {result['error']}", is_error=True)
+        items = result.get("items", []) if isinstance(result, dict) else []
+        output = f"Timeline ({len(items)} items):\n\n"
+        for item in items[:10]:
+            output += f"- [{item.get('id', '?')}] {item.get('title', '')}\n"
+            output += f"  {item.get('created_at', '')} | {item.get('type', '')}\n\n"
+        return _tool_result(output)
+    except Exception as e:
+        return _tool_result(f"Timeline error: {e}", is_error=True)
 
 
 def handle_get_observations(args: Dict) -> Dict:
-    ids = args.get("ids", [])
-    if isinstance(ids, int):
-        ids = [ids]
-    elif isinstance(ids, str):
-        ids = [int(x.strip()) for x in ids.split(",") if x.strip().isdigit()]
-    if not ids:
-        return _tool_result("Error: no valid IDs provided", is_error=True)
-    result = _make_request("/api/observations/batch", method="POST", body={"ids": ids})
-    if "error" in result:
-        return _tool_result(f"Error: {result['error']}", is_error=True)
-    observations = result if isinstance(result, list) else []
-    output = f"Fetched {len(observations)} observations:\n\n"
-    for obs in observations:
-        output += f"=== #{obs.get('id', '?')} ===\n"
-        output += f"Type: {obs.get('type', '')}\n"
-        output += f"Project: {obs.get('project', '')}\n"
-        text = obs.get('text') or 'N/A'
-        output += f"Text:\n{text}\n\n"
-    return _tool_result(output)
+    if not _ensure_worker_running():
+        return {"type": "text", "text": "ERROR: Worker not available (auto-start failed)"}
+    try:
+        ids = args.get("ids", [])
+        if isinstance(ids, int):
+            ids = [ids]
+        elif isinstance(ids, str):
+            ids = [int(x.strip()) for x in ids.split(",") if x.strip().isdigit()]
+        if not ids:
+            return _tool_result("Error: no valid IDs provided", is_error=True)
+        result = _make_request("/api/observations/batch", method="POST", body={"ids": ids})
+        if "error" in result:
+            return _tool_result(f"Error: {result['error']}", is_error=True)
+        observations = result if isinstance(result, list) else []
+        output = f"Fetched {len(observations)} observations:\n\n"
+        for obs in observations:
+            output += f"=== #{obs.get('id', '?')} ===\n"
+            output += f"Type: {obs.get('type', '')}\n"
+            output += f"Project: {obs.get('project', '')}\n"
+            text = obs.get('text') or 'N/A'
+            output += f"Text:\n{text}\n\n"
+        return _tool_result(output)
+    except Exception as e:
+        return _tool_result(f"Get observations error: {e}", is_error=True)
 
 
 def handle_inject(args: Dict) -> Dict:
-    project = args.get("project", "")
-    limit = args.get("limit", 50)
-    params = f"?limit={limit}"
-    if project:
-        params += f"&project={urllib.parse.quote(project)}"
-    result = _make_request(f"/api/context/inject{params}")
-    if "error" in result:
-        return _tool_result(f"Inject error: {result['error']}", is_error=True)
-    context = result.get("context") if isinstance(result, dict) else str(result)
-    return _tool_result(context)
+    if not _ensure_worker_running():
+        return {"type": "text", "text": "ERROR: Worker not available (auto-start failed)"}
+    try:
+        project = args.get("project", "")
+        limit = args.get("limit", 50)
+        params = f"?limit={limit}"
+        if project:
+            params += f"&project={urllib.parse.quote(project)}"
+        result = _make_request(f"/api/context/inject{params}")
+        if "error" in result:
+            return _tool_result(f"Inject error: {result['error']}", is_error=True)
+        context = result.get("context") if isinstance(result, dict) else str(result)
+        return _tool_result(context)
+    except Exception as e:
+        return _tool_result(f"Inject error: {e}", is_error=True)
 
 
 def handle_stats(args: Dict) -> Dict:
-    result = _make_request("/api/stats")
-    if "error" in result:
-        return _tool_result(f"Stats error: {result['error']}", is_error=True)
-    db_info = result.get("database", {})
-    worker_info = result.get("worker", {})
-    output = "=== Claude-Mem Statistics ===\n\n"
-    output += f"Worker Version: {worker_info.get('version', 'N/A')}\n"
-    output += f"Uptime: {worker_info.get('uptime', 0)}s\n"
-    output += f"Active Sessions: {worker_info.get('activeSessions', 0)}\n\n"
-    output += f"Total Observations: {db_info.get('observations', 0)}\n"
-    output += f"Total Summaries: {db_info.get('summaries', 0)}\n"
-    output += f"Total Sessions: {db_info.get('sessions', 0)}\n"
-    size_bytes = db_info.get('size', 0)
-    if size_bytes:
-        output += f"Database Size: {size_bytes / 1024 / 1024:.1f} MB\n"
-    return _tool_result(output)
+    if not _ensure_worker_running():
+        return {"type": "text", "text": "ERROR: Worker not available (auto-start failed)"}
+    try:
+        result = _make_request("/api/stats")
+        if "error" in result:
+            return _tool_result(f"Stats error: {result['error']}", is_error=True)
+        db_info = result.get("database", {})
+        worker_info = result.get("worker", {})
+        output = "=== Claude-Mem Statistics ===\n\n"
+        output += f"Worker Version: {worker_info.get('version', 'N/A')}\n"
+        output += f"Uptime: {worker_info.get('uptime', 0)}s\n"
+        output += f"Active Sessions: {worker_info.get('activeSessions', 0)}\n\n"
+        output += f"Total Observations: {db_info.get('observations', 0)}\n"
+        output += f"Total Summaries: {db_info.get('summaries', 0)}\n"
+        output += f"Total Sessions: {db_info.get('sessions', 0)}\n"
+        size_bytes = db_info.get('size', 0)
+        if size_bytes:
+            output += f"Database Size: {size_bytes / 1024 / 1024:.1f} MB\n"
+        return _tool_result(output)
+    except Exception as e:
+        return _tool_result(f"Stats error: {e}", is_error=True)
 
 
 TOOLS = [
     {
         "name": "trae_mem_hook_event",
-        "description": """接收Trae IDE的生命周期事件并转发到Claude-Mem Worker (v5 - 源码审查后全面改进)。
+        "description": """接收Trae IDE的生命周期事件并转发到Claude-Mem Worker (v6 - 自动启动Worker)。
 
 支持事件类型:
 - SessionStart: 会话开始(初始化+注入历史上下文) -> hook: context
@@ -406,7 +502,8 @@ TOOLS = [
 - Stop: 停止时(生成会话摘要) -> HTTP API /api/sessions/summarize
 - SessionEnd: 会话结束 -> HTTP API /api/sessions/complete
 
-改进: SKIP_TOOLS客户端过滤, summarize/session-complete走HTTP API, 驼峰+下划线双兼容, 防御性默认值""",
+v6特性: Worker自动检测与启动(用户无需手动启动, 打开Trae即用)
+v5改进: SKIP_TOOLS客户端过滤, summarize/session-complete走HTTP API, 驼峰+下划线双兼容, 防御性默认值""",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -512,8 +609,9 @@ def serve_stdio():
     _write({"jsonrpc": "2.0", "result": {
         "protocolVersion": "2024-11-05",
         "capabilities": {},
-        "serverInfo": {"name": "trae-mem-bridge", "version": "5.0.0"}
+        "serverInfo": {"name": "trae-mem-bridge", "version": "6.0.0"}
     }})
+    _ensure_worker_running()
     while True:
         raw = _read()
         if not raw:
@@ -528,7 +626,7 @@ def serve_stdio():
                 "result": {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "trae-mem-bridge", "version": "5.0.0"}
+                    "serverInfo": {"name": "trae-mem-bridge", "version": "6.0.0"}
                 }
             })
         elif method == "tools/list":
@@ -553,8 +651,8 @@ def serve_stdio():
 
 
 if __name__ == "__main__":
-    print("[trae-mem-bridge v5] Starting MCP server...", file=sys.stderr)
-    print(f"[trae-mem-bridge v5] Plugin root: {PLUGIN_ROOT}", file=sys.stderr)
-    print(f"[trae-mem-bridge v5] Bun runner: {BUN_RUNNER}", file=sys.stderr)
-    print(f"[trae-mem-bridge v5] platform=trae | SKIP_TOOLS={len(SKIP_TOOLS)} tools | HTTP API for summarize/complete", file=sys.stderr)
+    print("[trae-mem-bridge v6] Starting MCP server...", file=sys.stderr)
+    print(f"[trae-mem-bridge v6] Plugin root: {PLUGIN_ROOT}", file=sys.stderr)
+    print(f"[trae-mem-bridge v6] Bun runner: {BUN_RUNNER}", file=sys.stderr)
+    print(f"[trae-mem-bridge v6] Auto-start enabled | platform=trae | SKIP_TOOLS={len(SKIP_TOOLS)} tools | HTTP API for summarize/complete", file=sys.stderr)
     serve_stdio()
