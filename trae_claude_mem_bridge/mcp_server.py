@@ -34,7 +34,16 @@ WORKER_HOST = "127.0.0.1"
 WORKER_PORT = 37777
 WORKER_URL = f"http://{WORKER_HOST}:{WORKER_PORT}"
 
-PLUGIN_ROOT = r"C:\Users\86150\.claude\plugins\cache\thedotmack\claude-mem\12.1.0"
+def _get_plugin_root() -> str:
+    plugin_root = os.environ.get("CLAUDE_MEM_PLUGIN_ROOT")
+    if plugin_root and os.path.isdir(plugin_root):
+        return plugin_root
+    default = os.path.expanduser(r"~/.claude/plugins/cache/thedotmack/claude-mem/12.1.0")
+    if os.path.isdir(default):
+        return default
+    raise FileNotFoundError("Claude-Mem plugin not found. Set CLAUDE_MEM_PLUGIN_ROOT env var.")
+
+PLUGIN_ROOT = _get_plugin_root()
 BUN_RUNNER = os.path.join(PLUGIN_ROOT, "scripts", "bun-runner.js")
 WORKER_SERVICE = os.path.join(PLUGIN_ROOT, "scripts", "worker-service.cjs")
 
@@ -140,7 +149,7 @@ def _find_bun_executable() -> Optional[str]:
     common_paths = [
         os.path.expanduser(r"~\.bun\bin\bun.exe"),
         os.path.join(os.environ.get("LOCALAPPDATA", ""), "Bun", "bun.exe"),
-        r"C:\Users\86150\.bun\bin\bun.exe",
+        os.path.expanduser(r"~/.bun/bin/bun.exe"),
     ]
     for p in common_paths:
         if os.path.isfile(p):

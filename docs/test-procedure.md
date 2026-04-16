@@ -169,7 +169,7 @@ Database Size: x.x MB
 **症状**：MCP 请求返回 "ERROR: Worker not available"
 **排查**：
 1. 检查 bun.exe 是否在 PATH 中
-2. 检查 `C:\Users\86150\.bun\bin\bun.exe` 是否存在
+2. 检查 `~/.bun/bin/bun.exe` 是否存在
 3. 查看 stderr 日志输出
 
 ### 7.2 端口被占用
