@@ -1,0 +1,4 @@
+{
+  "_comment": "Trae project_id → 项目名映射。可手动覆盖自动推断结果。",
+  "_usage": "运行 import_trae_v2.py 时自动加载此文件"
+}

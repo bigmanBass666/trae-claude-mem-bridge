@@ -1,0 +1,16 @@
+{
+  "_comment": "project_id (hash) → 真实项目路径映射，来源于 trae_complete_data.json 的 project + multi_root_path 表",
+  "_mapping_chain": "chat_session.project_id → project.col1 → project.col0 → multi_root_path.col0 → multi_root_path.col2",
+  "69ef5a5273dacb9befbd2ba0": "D:\\Test\\disk_scan",
+  "69ef5d9d73dacb9befbd2c23": "D:\\Test\\trae-unlock",
+  "69efdb4bbe868131349e5815": "D:\\Test\\cpe",
+  "69f04404087e62d83ff6d7ea": "D:\\Working\\Code\\Android\\Experiment_5",
+  "69f0aa1ed845a38a140b9d8e": "D:\\Test\\api_key_test",
+  "69f0afdfd845a38a140b9f3d": "D:\\Working\\programming_projects\\jason-skill-hub",
+  "69f0de17c7da4a2ef507d10d": "D:\\Working\\programming_projects\\remote_gateway",
+  "69f0f9d2c7da4a2ef507d392": "D:\\Test\\frontend-design_test",
+  "69f0fe89a2190bad95c95b0c": "D:\\Test\\prompt_archetect",
+  "69f2e1b3688f07a8c634800a": "D:\\Test\\jerry_ZhuanShengBen",
+  "69f3a73f9430d58ee53c3e88": "D:\\Test\\trae-solo-unlock",
+  "69f3a8819430d58ee53c3e8a": "D:\\Working\\programming_projects\\BoltTranslate"
+}

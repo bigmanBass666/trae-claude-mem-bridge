@@ -9,6 +9,8 @@ build/
 *.json
 !package.json
 !tsconfig.json
+!scripts/trae_project_map.json
+!scripts/trae_project_paths.json
 
 *.zip
 *.rar

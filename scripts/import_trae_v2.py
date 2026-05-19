@@ -21,6 +21,7 @@ from urllib.parse import unquote
 DATA_SOURCE = r"D:\Test\claude_test\subagent_test\trae_db_export\trae_full_data.json"
 CLAUDE_MEM_DB = os.path.expanduser(r"~\.claude-mem\claude-mem.db")
 PROJECT_MAP_FILE = os.path.join(os.path.dirname(__file__), "trae_project_map.json")
+PROJECT_PATHS_FILE = os.path.join(os.path.dirname(__file__), "trae_project_paths.json")
 
 # 自动生成的标题（过滤掉）
 AUTO_TITLES = {
@@ -97,13 +98,20 @@ def infer_project_from_paths(paths):
     return names
 
 
-def infer_project_name(project_id, conversations, manual_map=None):
+def infer_project_name(project_id, conversations, manual_map=None, project_paths=None):
     """推断项目名"""
     # 0. 手动映射优先
     if manual_map and project_id in manual_map:
         return manual_map[project_id]
 
-    # 1. 从文件路径推断
+    # 1. 从 database.db 的 project + multi_root_path 表获取真实路径
+    if project_paths and project_id in project_paths:
+        real_path = project_paths[project_id]
+        name = path_to_project_name(real_path)
+        if name:
+            return name
+
+    # 2. 从消息中的文件路径推断
     all_paths = []
     for conv in conversations:
         for msg in conv.get("messages", []):
@@ -114,7 +122,7 @@ def infer_project_name(project_id, conversations, manual_map=None):
         counter = Counter(path_names)
         return counter.most_common(1)[0][0]
 
-    # 2. 从有意义的 session_title 推断
+    # 3. 从有意义的 session_title 推断
     titles = []
     for conv in conversations:
         title = conv.get("session", {}).get("session_title", "")
@@ -124,7 +132,7 @@ def infer_project_name(project_id, conversations, manual_map=None):
         counter = Counter(titles)
         return counter.most_common(1)[0][0]
 
-    # 3. fallback
+    # 4. fallback
     return f"project-{project_id[-8:]}"
 
 
@@ -183,6 +191,30 @@ def load_manual_map():
     return {}
 
 
+def load_project_paths():
+    """加载项目路径映射（来自 database.db 的 project + multi_root_path 表）"""
+    if os.path.exists(PROJECT_PATHS_FILE):
+        with open(PROJECT_PATHS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            # 过滤掉注释字段
+            return {k: v for k, v in data.items() if not k.startswith("_")}
+    return {}
+
+
+def path_to_project_name(path):
+    """从真实项目路径提取项目名"""
+    if not path:
+        return None
+    # 取最后一个非空目录名
+    parts = path.replace("\\", "/").rstrip("/").split("/")
+    # 跳过常见根目录
+    skip = {"test", "working", "code", "programming_projects", "installations"}
+    for part in reversed(parts):
+        if part.lower() not in skip and part:
+            return part
+    return None
+
+
 def save_manual_map(mapping):
     """保存手动映射表"""
     with open(PROJECT_MAP_FILE, "w", encoding="utf-8") as f:
@@ -217,6 +249,10 @@ def main():
     # 加载手动映射
     manual_map = load_manual_map()
 
+    # 加载项目路径映射
+    project_paths = load_project_paths()
+    print(f"加载 {len(project_paths)} 个项目路径映射")
+
     # 按 project_id 分组
     project_groups = {}
     for conv in conversations:
@@ -230,7 +266,7 @@ def main():
     # 推断项目名
     project_names = {}
     for pid, convs in project_groups.items():
-        name = infer_project_name(pid, convs, manual_map)
+        name = infer_project_name(pid, convs, manual_map, project_paths)
         project_names[pid] = name
         print(f"  {pid[:16]}... -> {name} ({len(convs)} 对话)")
 
